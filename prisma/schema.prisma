@@ -1,0 +1,247 @@
+// Smart QR — Prisma Schema
+// ORM: Prisma v5 | DB: SQLite (dev/test) → swap to MySQL for production
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Auth.js (NextAuth v5) adapter tables
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String?   @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?   // hashed, only set for credentials provider
+
+  role              String      @default("FREE") // FREE | PAID | ADMIN
+  stripeCustomerId  String?     @unique
+
+  accounts          Account[]
+  sessions          Session[]
+  qrCodes           QRCode[]
+  subscription      Subscription?
+  onepageWebsites   OnepageWebsite[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ---------------------------------------------------------------------------
+// QR Codes
+// ---------------------------------------------------------------------------
+
+model QRCode {
+  id        String     @id @default(cuid())
+  userId    String?    // null = anonymous (not persisted after session)
+  type      String     @default("STATIC") // STATIC | SMART
+  qrSubtype String     @default("URL")    // URL | WIFI | VCARD | ONEPAGE
+
+  // Optional human-readable label (shows in dashboard + analytics filter)
+  name      String?
+
+  // Redirect target (URL / Smart QR destination)
+  targetUrl String?
+
+  // Short code used in /r/[shortCode] — only for SMART type
+  shortCode String?    @unique
+
+  // WiFi fields
+  wifiSsid       String?
+  wifiPassword   String?
+  wifiEncryption String?   @default("WPA")
+
+  // vCard fields (stored as serialised JSON string for SQLite compatibility)
+  vcardData String?
+
+  // Styling (Paid feature)
+  logoUrl         String?
+  foregroundColor String  @default("#000000")
+  backgroundColor String  @default("#ffffff")
+
+  // Relations
+  user     User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  history  SmartQRHistory[]
+  scans    Scan[]
+  abTest   ABTest?
+  onepage  OnepageWebsite?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([shortCode])
+}
+
+model SmartQRHistory {
+  id        String   @id @default(cuid())
+  qrCodeId  String
+  targetUrl String
+  changedAt DateTime @default(now())
+
+  qrCode QRCode @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+
+  @@index([qrCodeId])
+}
+
+// ---------------------------------------------------------------------------
+// Analytics
+// ---------------------------------------------------------------------------
+
+model Scan {
+  id        String   @id @default(cuid())
+  qrCodeId  String
+  scannedAt DateTime @default(now())
+
+  // Geo (from IP geolocation headers — Vercel / Cloudflare)
+  country String?
+  city    String?
+  region  String?
+
+  // Device info (parsed from User-Agent)
+  device  String?  // mobile | desktop | tablet
+  browser String?
+  os      String?
+
+  // Privacy: SHA-256 of (IP + daily salt) — raw IP never stored
+  ipHash   String?
+  referrer String?
+
+  qrCode QRCode @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+
+  @@index([qrCodeId])
+  @@index([scannedAt])
+}
+
+// ---------------------------------------------------------------------------
+// A/B Testing
+// ---------------------------------------------------------------------------
+
+model ABTest {
+  id       String @id @default(cuid())
+  qrCodeId String @unique
+
+  variantAUrl  String
+  variantBUrl  String
+  splitPercent Int    @default(50) // % of traffic going to variant A
+
+  scanCountA Int     @default(0)
+  scanCountB Int     @default(0)
+  active     Boolean @default(true)
+
+  qrCode QRCode @relation(fields: [qrCodeId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ---------------------------------------------------------------------------
+// Stripe / Billing
+// ---------------------------------------------------------------------------
+
+model Subscription {
+  id     String @id @default(cuid())
+  userId String @unique
+
+  stripeCustomerId     String  @unique
+  stripeSubscriptionId String  @unique
+  status               String    @default("INACTIVE") // ACTIVE | INACTIVE | PAST_DUE | CANCELED | TRIALING
+
+  // Metered billing — track active Smart QR count for usage reporting
+  slotsUsed Int @default(0)
+
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  cancelAtPeriodEnd  Boolean   @default(false)
+
+  items SubscriptionItem[]
+  user  User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+}
+
+model SubscriptionItem {
+  id             String @id @default(cuid())
+  subscriptionId String
+  stripeItemId   String @unique  // Stripe subscription item ID for usage records
+
+  subscription Subscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+}
+
+// ---------------------------------------------------------------------------
+// One-page Website Builder
+// ---------------------------------------------------------------------------
+
+model OnepageWebsite {
+  id       String           @id @default(cuid())
+  userId   String
+  qrCodeId String?          @unique  // optional linked QR that redirects here
+  slug     String           @unique  // e.g. "john-doe-card" → /p/john-doe-card
+  template String           @default("VCARD") // VCARD | CAR | LINK
+  content  String           // freeform JSON string per template type
+  published Boolean         @default(false)
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  qrCode QRCode? @relation(fields: [qrCodeId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([slug])
+}
+
+// Note: Enums are stored as plain String fields for SQLite compatibility.
+// Swap provider to "mysql" or "postgresql" for production and restore native enums.
